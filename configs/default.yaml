@@ -1,0 +1,66 @@
+run_name: test
+
+paths:
+  tempo_dir: /mnt/data3/TEMPO/NO2_L3_V03
+  airnow_dir: /mnt/data3/AirNow
+  checkpoint_root: checkpoints
+  output_root: output
+  checkpoint_filename: best_model.pt
+  graph_filename: unified_graph.npz
+  metrics_filename: metrics.json
+
+data:
+  start_date: "2023-07-01"
+  end_date: "2024-06-30"
+  context_steps: 8
+  max_time_snap_hours: 0.75
+  min_valid_targets: 1
+  target_variable: no2
+  tempo_variable: product/vertical_column_troposphere
+  tempo_quality_variable: product/main_data_quality_flag
+  local_context_k: 5
+  min_context_k: 3
+  max_context_k: 5
+  station_neighbor_k: 5
+  tempo_neighbor_k: 4
+  max_column: 5.0e16
+
+model:
+  input_dim: 6
+  hidden_dim: 96
+  state_dim: 8
+  spatial_layers: 2
+  temporal_layers: 2
+  dropout: 0.1
+
+training:
+  seed: 7
+  epochs: 25
+  batch_size: 8
+  lr: 0.0003
+  weight_decay: 0.00001
+  loss: huber
+  huber_delta: 1.0
+  train_fraction: 0.70
+  val_fraction: 0.15
+  num_workers: 0
+  device: auto
+  grad_clip_norm: 1.0
+  show_progress: true
+  multi_gpu: off
+  gpu_min_free_memory_gb: 2.0
+  gpu_max_count: 2
+
+inference:
+  start_date: "2024-07-01"
+  end_date: "2024-09-30"
+  min_valid_targets: 0
+  batch_size: 1
+  num_workers: 0
+  device: auto
+  show_progress: true
+  multi_gpu: off
+  gpu_min_free_memory_gb: 2.0
+  gpu_max_count: 2
+  output_csv_filename: predictions.csv
+  output_netcdf_filename: predictions.nc
