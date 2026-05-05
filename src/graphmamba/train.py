@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from graphmamba.config import ensure_dir, load_config, resolve_run_paths
 from graphmamba.data import TempoAirNowDataset, collate_samples, split_indices
@@ -153,6 +154,11 @@ def make_progress_bar(
     )
     bar.refresh()
     return bar
+
+
+def log_progress_event(enabled: bool, payload: dict[str, Any]) -> None:
+    if enabled:
+        print(json.dumps(payload), flush=True)
 
 
 @torch.no_grad()
@@ -311,6 +317,8 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
 
     epochs = int(train_cfg.get("epochs", 25))
     show_progress = bool(train_cfg.get("show_progress", True))
+    batch_log_interval = int(train_cfg.get("batch_log_interval", 0))
+    log_batches = batch_log_interval > 0
     epoch_progress = make_progress_bar(
         range(1, epochs + 1),
         desc="epochs",
@@ -330,7 +338,18 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
             leave=True,
             total=len(train_loader),
         )
-        for batch in progress:
+        epoch_start = time.perf_counter()
+        for batch_idx, batch in enumerate(progress, start=1):
+            batch_start = time.perf_counter()
+            log_progress_event(
+                log_batches and (batch_idx == 1 or batch_idx % batch_log_interval == 0),
+                {
+                    "event": "train_batch_start",
+                    "epoch": epoch,
+                    "batch": batch_idx,
+                    "total_batches": len(train_loader),
+                },
+            )
             x = batch["x"].to(device)
             dt = batch["dt"].to(device)
             y = batch["y"].to(device)
@@ -350,8 +369,22 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
+            elapsed = time.perf_counter() - batch_start
+            log_progress_event(
+                log_batches and (batch_idx == 1 or batch_idx % batch_log_interval == 0),
+                {
+                    "event": "train_batch_done",
+                    "epoch": epoch,
+                    "batch": batch_idx,
+                    "total_batches": len(train_loader),
+                    "loss": float(loss.detach().cpu()),
+                    "batch_seconds": round(elapsed, 3),
+                    "epoch_seconds": round(time.perf_counter() - epoch_start, 3),
+                },
+            )
             if show_progress:
                 progress.set_postfix(loss=np.mean(losses))
+                progress.refresh()
 
         val_metrics = evaluate(
             model,

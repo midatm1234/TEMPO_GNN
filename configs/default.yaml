@@ -47,6 +47,7 @@ training:
   device: auto
   grad_clip_norm: 1.0
   show_progress: true
+  batch_log_interval: 1
   multi_gpu: off
   gpu_min_free_memory_gb: 2.0
   gpu_max_count: 2
