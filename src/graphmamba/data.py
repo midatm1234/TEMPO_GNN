@@ -57,15 +57,18 @@ def discover_aligned_scans(
     start_date: str | None,
     end_date: str | None,
     max_time_snap_hours: float,
+    lead_time: float = 0.0,
 ) -> list[AlignedScan]:
-    """Snap each TEMPO scan to its nearest AirNow hourly UTC timestamp."""
+    """Snap each TEMPO scan to an AirNow target timestamp after lead-time shifting."""
     candidates: dict[pd.Timestamp, tuple[Path, pd.Timestamp, float]] = {}
+    lead_delta = pd.Timedelta(hours=float(lead_time))
     for path in iter_tempo_files(tempo_dir, start_date, end_date):
         scan_time = parse_tempo_time(path)
-        target_time = scan_time.round("h")
-        snap_hours = abs((scan_time - target_time).total_seconds()) / 3600.0
+        predictor_time = scan_time.round("h")
+        snap_hours = abs((scan_time - predictor_time).total_seconds()) / 3600.0
         if snap_hours > max_time_snap_hours:
             continue
+        target_time = predictor_time + lead_delta
         airnow_path = _airnow_file_for_time(airnow_dir, target_time)
         if not airnow_path.exists():
             continue
@@ -114,6 +117,7 @@ class TempoAirNowDataset(Dataset):
         scan_indices: np.ndarray | None = None,
         target_mean: float = 0.0,
         target_std: float = 1.0,
+        lead_time: float = 0.0,
     ) -> None:
         if context_steps < 1:
             raise ValueError("context_steps must be positive.")
@@ -122,6 +126,7 @@ class TempoAirNowDataset(Dataset):
         self.airnow_dir = Path(airnow_dir)
         self.context_steps = context_steps
         self.max_column = float(max_column)
+        self.lead_time = float(lead_time)
         self.target_mean = float(target_mean)
         self.target_std = float(max(target_std, 1e-6))
         self.aligned_scans = discover_aligned_scans(
@@ -130,6 +135,7 @@ class TempoAirNowDataset(Dataset):
             start_date=start_date,
             end_date=end_date,
             max_time_snap_hours=max_time_snap_hours,
+            lead_time=self.lead_time,
         )
         if len(self.aligned_scans) < context_steps:
             raise ValueError(f"Only {len(self.aligned_scans)} aligned scans found; need at least {context_steps}.")
@@ -180,7 +186,7 @@ class TempoAirNowDataset(Dataset):
     def __len__(self) -> int:
         return int(self.end_indices.size)
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str | float]:
         end_idx = int(self.end_indices[index])
         start_idx = end_idx - self.context_steps + 1
         scans = self.aligned_scans[start_idx : end_idx + 1]
@@ -199,6 +205,7 @@ class TempoAirNowDataset(Dataset):
             "y_mask": torch.from_numpy(y_mask.astype(bool)),
             "target_time": str(scans[-1].target_time),
             "scan_time": str(scans[-1].scan_time),
+            "lead_time": float(self.lead_time),
         }
 
     def _load_node_features(self, scan: AlignedScan) -> np.ndarray:
@@ -272,4 +279,5 @@ def collate_samples(batch: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {key: torch.stack([item[key] for item in batch], dim=0) for key in tensor_keys}
     out["target_time"] = [item["target_time"] for item in batch]
     out["scan_time"] = [item["scan_time"] for item in batch]
+    out["lead_time"] = [item["lead_time"] for item in batch]
     return out

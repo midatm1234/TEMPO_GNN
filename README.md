@@ -65,13 +65,23 @@ You can set the training date range and chronological validation split there:
 data:
   start_date: "2023-08-01"
   end_date: "2024-09-30"
+  lead_time: 0
 
 training:
   train_fraction: 0.70
   val_fraction: 0.15
+  resume_training: true
 ```
 
 The test fraction is the remaining part of the aligned windows.
+`lead_time` is measured in hours from the final predictor scan's nearest AirNow
+hour to the target AirNow hour; `0` keeps target and predictors aligned at the
+same hour.
+
+When `resume_training` is true, training resumes from
+`checkpoints/<run_name>/last_model.pt` when available, otherwise from
+`checkpoints/<run_name>/best_model.pt`. The trainer keeps `best_model.pt` for
+inference and writes `last_model.pt` after each completed epoch for continuation.
 
 The trainer aligns TEMPO scans to the nearest AirNow hourly UTC timestamp,
 computes actual scan-to-scan `delta_t_hours`, uses only the hours where both
@@ -81,7 +91,7 @@ of AirNow nodes only.
 Metrics include RMSE, R2, and error correlations with both `delta_t_hours` and
 station-to-nearest-TEMPO distance.
 
-Training uses notebook-friendly progress bars for epochs, batches, validation,
+Training uses notebook-friendly progress bars for training batches, validation,
 and test evaluation. It also writes an epoch-vs-loss plot to:
 
 ```text

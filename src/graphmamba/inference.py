@@ -9,14 +9,13 @@ import pandas as pd
 import torch
 import xarray as xr
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from graphmamba.config import ensure_dir
 from graphmamba.config import resolve_run_paths
 from graphmamba.data import TempoAirNowDataset, collate_samples
 from graphmamba.graph import load_graph_npz
 from graphmamba.model import GraphBoundPredictor, UnifiedGraphMambaPredictor
-from graphmamba.train import graph_tensors, runtime_device_and_gpu_ids
+from graphmamba.train import graph_tensors, make_progress_bar, runtime_device_and_gpu_ids
 
 
 @dataclass
@@ -112,11 +111,16 @@ def predict_dataframe(
     nearest_dist = dataset.graph["nearest_tempo_distance_km"].astype(float)
 
     rows: list[dict[str, object]] = []
-    if show_progress:
-        iterator = tqdm(loader, desc="inference batches", total=len(loader), position=0, leave=True, dynamic_ncols=True)
-        iterator.refresh()
-    else:
-        iterator = loader
+    iterator = make_progress_bar(
+        loader,
+        desc="Running inference",
+        show_progress=show_progress,
+        position=0,
+        leave=True,
+        total=len(loader),
+        unit="batch",
+        colour="blue",
+    )
     for batch in iterator:
         x = batch["x"].to(bundle.device)
         dt = batch["dt"].to(bundle.device)
@@ -134,6 +138,8 @@ def predict_dataframe(
                 rows.append(
                     {
                         "target_time": target_time,
+                        "predictor_scan_time": batch["scan_time"][batch_idx],
+                        "lead_time": float(batch["lead_time"][batch_idx]),
                         "site_id": site_id,
                         "site_name": site_names[station_idx],
                         "agency": agencies[station_idx],

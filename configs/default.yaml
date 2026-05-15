@@ -13,6 +13,7 @@ data:
   start_date: "2023-07-01"
   end_date: "2024-06-30"
   context_steps: 8
+  lead_time: 0
   max_time_snap_hours: 0.75
   min_valid_targets: 1
   target_variable: no2
@@ -35,8 +36,8 @@ model:
 
 training:
   seed: 7
-  epochs: 25
-  batch_size: 8
+  epochs: 50
+  batch_size: 32
   lr: 0.0003
   weight_decay: 0.00001
   loss: huber
@@ -47,10 +48,11 @@ training:
   device: auto
   grad_clip_norm: 1.0
   show_progress: true
-  batch_log_interval: 1
-  multi_gpu: off
-  gpu_min_free_memory_gb: 2.0
-  gpu_max_count: 2
+  resume_training: true
+  batch_log_interval: 0
+  multi_gpu: on
+  gpu_min_free_memory_gb: 20.
+  gpu_max_count: 4
 
 inference:
   start_date: "2024-07-01"
@@ -60,8 +62,8 @@ inference:
   num_workers: 0
   device: auto
   show_progress: true
-  multi_gpu: off
-  gpu_min_free_memory_gb: 2.0
-  gpu_max_count: 2
+  multi_gpu: on
+  gpu_min_free_memory_gb: 20.
+  gpu_max_count: 4
   output_csv_filename: predictions.csv
   output_netcdf_filename: predictions.nc

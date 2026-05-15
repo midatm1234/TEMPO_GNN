@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from graphmamba.config import ensure_dir, load_config, resolve_run_paths
 from graphmamba.data import TempoAirNowDataset, collate_samples, split_indices
@@ -141,24 +141,109 @@ def make_progress_bar(
     position: int = 0,
     leave: bool = True,
     total: int | None = None,
+    unit: str = "batch",
+    colour: str | None = None,
 ) -> Any:
     if not show_progress:
         return iterable
+    kwargs: dict[str, Any] = {
+        "desc": desc,
+        "total": total,
+        "position": position,
+        "leave": leave,
+        "unit": unit,
+        "dynamic_ncols": True,
+    }
+    if colour is not None:
+        kwargs["colour"] = colour
     bar = tqdm(
         iterable,
-        desc=desc,
-        total=total,
-        position=position,
-        leave=leave,
-        dynamic_ncols=True,
+        **kwargs,
     )
-    bar.refresh()
     return bar
 
 
 def log_progress_event(enabled: bool, payload: dict[str, Any]) -> None:
     if enabled:
         print(json.dumps(payload), flush=True)
+
+
+def _last_checkpoint_path(checkpoint_dir: str | Path) -> Path:
+    return Path(checkpoint_dir) / "last_model.pt"
+
+
+def _history_last_epoch(history: list[dict[str, Any]]) -> int:
+    epochs = [int(row["epoch"]) for row in history if "epoch" in row]
+    return max(epochs, default=0)
+
+
+def _best_val_rmse_from_history(history: list[dict[str, Any]]) -> float:
+    values = []
+    for row in history:
+        try:
+            value = float(row.get("val_rmse", float("nan")))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            values.append(value)
+    return min(values, default=float("inf"))
+
+
+def _load_history(metrics_path: str | Path) -> list[dict[str, Any]]:
+    path = Path(metrics_path)
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as handle:
+        metrics = json.load(handle)
+    history = metrics.get("history", [])
+    return history if isinstance(history, list) else []
+
+
+def _restore_target_scaler(
+    target_stats: Any,
+    train_dataset: TempoAirNowDataset,
+    val_dataset: TempoAirNowDataset,
+    test_dataset: TempoAirNowDataset,
+    state: dict[str, Any],
+) -> None:
+    count = int(state.get("count", target_stats.count))
+    mean = float(state.get("mean", target_stats.mean))
+    std = float(state.get("std", target_stats.std))
+    target_stats.count = count
+    target_stats.mean = mean
+    target_stats.m2 = std**2 * max(count - 1, 0)
+    train_dataset.with_target_scaler(target_stats.mean, target_stats.std)
+    val_dataset.with_target_scaler(target_stats.mean, target_stats.std)
+    test_dataset.with_target_scaler(target_stats.mean, target_stats.std)
+
+
+def _save_training_checkpoint(
+    path: str | Path,
+    base_model: UnifiedGraphMambaPredictor,
+    optimizer: torch.optim.Optimizer,
+    config: dict[str, Any],
+    target_stats: Any,
+    graph: dict[str, Any],
+    device_ids: list[int],
+    epoch: int,
+    best_val_rmse: float,
+    history: list[dict[str, Any]],
+) -> None:
+    torch.save(
+        {
+            "model": base_model.state_dict(),
+            "base_model": base_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": config,
+            "target_scaler": target_stats.state_dict(),
+            "graph_metadata": graph["metadata"],
+            "device_ids": device_ids,
+            "epoch": int(epoch),
+            "best_val_rmse": float(best_val_rmse),
+            "history": history,
+        },
+        path,
+    )
 
 
 @torch.no_grad()
@@ -178,7 +263,16 @@ def evaluate(
     mask_all = []
     dt_all = []
     dist_all = []
-    iterator = make_progress_bar(loader, desc=desc, show_progress=show_progress, position=2, leave=True, total=len(loader))
+    iterator = make_progress_bar(
+        loader,
+        desc=desc,
+        show_progress=show_progress,
+        position=0,
+        leave=True,
+        total=len(loader),
+        unit="batch",
+        colour="green",
+    )
     for batch in iterator:
         x = batch["x"].to(device)
         dt = batch["dt"].to(device)
@@ -243,6 +337,7 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
         max_time_snap_hours=float(data_cfg.get("max_time_snap_hours", 0.75)),
         max_column=float(data_cfg.get("max_column", 5.0e16)),
         min_valid_targets=int(data_cfg.get("min_valid_targets", 1)),
+        lead_time=float(data_cfg.get("lead_time", 0.0)),
     )
 
     train_end, val_end, test_end = split_indices(
@@ -312,31 +407,69 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
 
     best_val_rmse = float("inf")
     best_path = Path(run_paths["checkpoint_path"])
+    last_path = _last_checkpoint_path(checkpoint_dir)
+    metrics_path = Path(run_paths["metrics_path"])
     history = []
     nearest_dist = graph["nearest_tempo_distance_km"].astype(np.float64)
 
     epochs = int(train_cfg.get("epochs", 25))
     show_progress = bool(train_cfg.get("show_progress", True))
+    resume_training = bool(train_cfg.get("resume_training", False))
     batch_log_interval = int(train_cfg.get("batch_log_interval", 0))
     log_batches = batch_log_interval > 0
-    epoch_progress = make_progress_bar(
-        range(1, epochs + 1),
-        desc="epochs",
-        show_progress=show_progress,
-        position=0,
-        leave=True,
-        total=epochs,
-    )
-    for epoch in epoch_progress:
+    start_epoch = 1
+    if resume_training:
+        resume_path = last_path if last_path.exists() else best_path
+        if resume_path.exists():
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+            base_model.load_state_dict(checkpoint.get("base_model", checkpoint["model"]))
+            if "optimizer" in checkpoint:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            if "target_scaler" in checkpoint:
+                _restore_target_scaler(target_stats, train_dataset, val_dataset, test_dataset, checkpoint["target_scaler"])
+            checkpoint_history = checkpoint.get("history")
+            history = checkpoint_history if isinstance(checkpoint_history, list) else _load_history(metrics_path)
+            best_val_rmse = float(checkpoint.get("best_val_rmse", _best_val_rmse_from_history(history)))
+            checkpoint_epoch = int(checkpoint.get("epoch", _history_last_epoch(history)))
+            start_epoch = checkpoint_epoch + 1
+            print(
+                json.dumps(
+                    {
+                        "resume_training": True,
+                        "checkpoint_path": str(resume_path),
+                        "checkpoint_epoch": checkpoint_epoch,
+                        "start_epoch": start_epoch,
+                        "epochs": epochs,
+                        "lead_time": float(data_cfg.get("lead_time", 0.0)),
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(
+                json.dumps(
+                    {
+                        "resume_training": True,
+                        "checkpoint_path": str(resume_path),
+                        "lead_time": float(data_cfg.get("lead_time", 0.0)),
+                        "message": "No checkpoint found; starting from epoch 1.",
+                    },
+                    indent=2,
+                )
+            )
+
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         losses = []
         progress = make_progress_bar(
             train_loader,
-            desc=f"epoch {epoch}/{epochs} train batches",
+            desc=f"Training Epoch {epoch}/{epochs}",
             show_progress=show_progress,
-            position=1,
+            position=0,
             leave=True,
             total=len(train_loader),
+            unit="batch",
+            colour="blue",
         )
         epoch_start = time.perf_counter()
         for batch_idx, batch in enumerate(progress, start=1):
@@ -383,8 +516,7 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
                 },
             )
             if show_progress:
-                progress.set_postfix(loss=np.mean(losses))
-                progress.refresh()
+                progress.set_postfix(loss=np.mean(losses), lr=optimizer.param_groups[0]["lr"])
 
         val_metrics = evaluate(
             model,
@@ -393,26 +525,39 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
             train_dataset.target_mean,
             train_dataset.target_std,
             nearest_dist,
-            desc=f"epoch {epoch}/{epochs} val",
+            desc="Validation Epoch",
             show_progress=show_progress,
         )
         row = {"epoch": epoch, "train_loss": float(np.mean(losses)), **{f"val_{k}": v for k, v in val_metrics.items()}}
         history.append(row)
-        if show_progress:
-            epoch_progress.set_postfix(train_loss=row["train_loss"], val_rmse=val_metrics["rmse"])
         print(json.dumps(row))
-        if np.isfinite(val_metrics["rmse"]) and val_metrics["rmse"] < best_val_rmse:
+        is_best = np.isfinite(val_metrics["rmse"]) and val_metrics["rmse"] < best_val_rmse
+        if is_best:
             best_val_rmse = val_metrics["rmse"]
-            torch.save(
-                {
-                    "model": base_model.state_dict(),
-                    "base_model": base_model.state_dict(),
-                    "config": config,
-                    "target_scaler": target_stats.state_dict(),
-                    "graph_metadata": graph["metadata"],
-                    "device_ids": device_ids,
-                },
+        _save_training_checkpoint(
+            last_path,
+            base_model,
+            optimizer,
+            config,
+            target_stats,
+            graph,
+            device_ids,
+            epoch,
+            best_val_rmse,
+            history,
+        )
+        if is_best:
+            _save_training_checkpoint(
                 best_path,
+                base_model,
+                optimizer,
+                config,
+                target_stats,
+                graph,
+                device_ids,
+                epoch,
+                best_val_rmse,
+                history,
             )
 
     if best_path.exists():
@@ -425,24 +570,27 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
         train_dataset.target_mean,
         train_dataset.target_std,
         nearest_dist,
-        desc="test",
+        desc="Test Epoch",
         show_progress=show_progress,
     )
     loss_plot_path = save_loss_plot(history, Path(output_dir) / "loss_curve.png") if history else None
     result = {
         "target_scaler": target_stats.state_dict(),
         "best_model": str(best_path),
+        "last_model": str(last_path),
         "checkpoint_dir": str(checkpoint_dir),
         "output_dir": str(output_dir),
         "graph_path": str(graph_path),
         "loss_plot": str(loss_plot_path) if loss_plot_path is not None else "",
         "device": str(device),
         "device_ids": device_ids,
+        "resume_training": resume_training,
+        "lead_time": float(data_cfg.get("lead_time", 0.0)),
         "history": history,
         "test": test_metrics,
         "graph": graph["metadata"],
     }
-    with Path(run_paths["metrics_path"]).open("w", encoding="utf-8") as handle:
+    with metrics_path.open("w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2)
     return result
 
