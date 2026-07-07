@@ -19,6 +19,9 @@ data:
   target_variable: no2
   tempo_variable: product/vertical_column_troposphere
   tempo_quality_variable: product/main_data_quality_flag
+  tempo_cloud_variable: support_data/eff_cloud_fraction
+  tempo_quality_flag_valid: 0
+  tempo_cloud_fraction_max: 0.2
   local_context_k: 5
   min_context_k: 3
   max_context_k: 5

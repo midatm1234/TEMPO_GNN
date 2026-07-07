@@ -338,6 +338,11 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
         max_column=float(data_cfg.get("max_column", 5.0e16)),
         min_valid_targets=int(data_cfg.get("min_valid_targets", 1)),
         lead_time=float(data_cfg.get("lead_time", 0.0)),
+        tempo_variable=str(data_cfg.get("tempo_variable", "product/vertical_column_troposphere")),
+        tempo_quality_variable=str(data_cfg.get("tempo_quality_variable", "product/main_data_quality_flag")),
+        tempo_cloud_variable=str(data_cfg.get("tempo_cloud_variable", "support_data/eff_cloud_fraction")),
+        tempo_quality_flag_valid=int(data_cfg.get("tempo_quality_flag_valid", 0)),
+        tempo_cloud_fraction_max=float(data_cfg.get("tempo_cloud_fraction_max", 0.2)),
     )
 
     train_end, val_end, test_end = split_indices(
