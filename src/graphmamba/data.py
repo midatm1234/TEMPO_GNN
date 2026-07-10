@@ -51,6 +51,37 @@ def _airnow_file_for_time(airnow_dir: str | Path, timestamp: pd.Timestamp) -> Pa
     return Path(airnow_dir) / f"airnow_no2_{date}.nc"
 
 
+def _split_variable_path(path: str | None) -> tuple[str | None, str]:
+    """Split a ``group/name`` reference; ``group`` may be ``None`` for root vars."""
+    if not path:
+        return None, ""
+    parts = str(path).strip("/").split("/")
+    if len(parts) == 1:
+        return None, parts[0]
+    return "/".join(parts[:-1]), parts[-1]
+
+
+def _read_tempo_variable(
+    path: Path,
+    group: str | None,
+    name: str,
+    lat_idx: np.ndarray,
+    lon_idx: np.ndarray,
+) -> np.ndarray | None:
+    """Read a TEMPO L3 variable at station-neighbour grid indices; returns ``None`` if absent."""
+    open_kwargs = {"decode_times": False, "mask_and_scale": True}
+    if group:
+        open_kwargs["group"] = group
+    with xr.open_dataset(path, **open_kwargs) as ds:
+        if name not in ds.variables:
+            return None
+        data = ds[name]
+        if "time" in data.dims:
+            data = data.isel(time=0)
+        grid = np.asarray(data.values)
+    return np.asarray(grid[lat_idx, lon_idx], dtype=np.float32)
+
+
 def discover_aligned_scans(
     tempo_dir: str | Path,
     airnow_dir: str | Path,
@@ -118,6 +149,11 @@ class TempoAirNowDataset(Dataset):
         target_mean: float = 0.0,
         target_std: float = 1.0,
         lead_time: float = 0.0,
+        tempo_variable: str = "product/vertical_column_troposphere",
+        tempo_quality_variable: str = "product/main_data_quality_flag",
+        tempo_cloud_variable: str = "support_data/eff_cloud_fraction",
+        tempo_quality_flag_valid: int = 0,
+        tempo_cloud_fraction_max: float = 0.2,
     ) -> None:
         if context_steps < 1:
             raise ValueError("context_steps must be positive.")
@@ -129,6 +165,11 @@ class TempoAirNowDataset(Dataset):
         self.lead_time = float(lead_time)
         self.target_mean = float(target_mean)
         self.target_std = float(max(target_std, 1e-6))
+        self.tempo_value_group, self.tempo_value_name = _split_variable_path(tempo_variable)
+        self.tempo_quality_group, self.tempo_quality_name = _split_variable_path(tempo_quality_variable)
+        self.tempo_cloud_group, self.tempo_cloud_name = _split_variable_path(tempo_cloud_variable)
+        self.tempo_quality_flag_valid = int(tempo_quality_flag_valid)
+        self.tempo_cloud_fraction_max = float(tempo_cloud_fraction_max)
         self.aligned_scans = discover_aligned_scans(
             tempo_dir=tempo_dir,
             airnow_dir=airnow_dir,
@@ -230,15 +271,20 @@ class TempoAirNowDataset(Dataset):
     def _load_tempo_values(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
         lat_idx = self.graph["tempo_lat_idx"].astype(np.int64)
         lon_idx = self.graph["tempo_lon_idx"].astype(np.int64)
-        with xr.open_dataset(path, group="product", decode_times=False, mask_and_scale=True) as ds:
-            values_grid = ds["vertical_column_troposphere"].isel(time=0).values
-            values = np.asarray(values_grid[lat_idx, lon_idx], dtype=np.float32)
-            if "main_data_quality_flag" in ds:
-                quality_grid = ds["main_data_quality_flag"].isel(time=0).values
-                quality = np.asarray(quality_grid[lat_idx, lon_idx])
-                valid = np.isfinite(values) & (quality == 0)
-            else:
-                valid = np.isfinite(values)
+        values = _read_tempo_variable(path, self.tempo_value_group, self.tempo_value_name, lat_idx, lon_idx)
+        valid = np.isfinite(values)
+        if self.tempo_quality_name:
+            quality = _read_tempo_variable(
+                path, self.tempo_quality_group, self.tempo_quality_name, lat_idx, lon_idx
+            )
+            if quality is not None:
+                valid = valid & (quality == self.tempo_quality_flag_valid)
+        if self.tempo_cloud_name:
+            cloud = _read_tempo_variable(
+                path, self.tempo_cloud_group, self.tempo_cloud_name, lat_idx, lon_idx
+            )
+            if cloud is not None:
+                valid = valid & np.isfinite(cloud) & (cloud <= self.tempo_cloud_fraction_max)
         values = np.where(valid, values, 0.0).astype(np.float32)
         return values, valid
 
