@@ -172,6 +172,10 @@ def _last_checkpoint_path(checkpoint_dir: str | Path) -> Path:
     return Path(checkpoint_dir) / "last_model.pt"
 
 
+def _best_checkpoint_path(checkpoint_dir: str | Path) -> Path:
+    return Path(checkpoint_dir) / "best_model.pt"
+
+
 def _history_last_epoch(history: list[dict[str, Any]]) -> int:
     epochs = [int(row["epoch"]) for row in history if "epoch" in row]
     return max(epochs, default=0)
@@ -406,7 +410,7 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
     )
 
     best_val_rmse = float("inf")
-    best_path = Path(run_paths["checkpoint_path"])
+    best_path = _best_checkpoint_path(checkpoint_dir)
     last_path = _last_checkpoint_path(checkpoint_dir)
     metrics_path = Path(run_paths["metrics_path"])
     history = []

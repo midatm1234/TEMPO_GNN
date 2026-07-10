@@ -5,7 +5,7 @@ paths:
   airnow_dir: /mnt/data3/AirNow
   checkpoint_root: checkpoints
   output_root: output
-  checkpoint_filename: best_model.pt
+  checkpoint_filename: last_model.pt
   graph_filename: unified_graph.npz
   metrics_filename: metrics.json
 
@@ -36,14 +36,14 @@ model:
 
 training:
   seed: 7
-  epochs: 50
+  epochs: 100
   batch_size: 32
   lr: 0.0003
   weight_decay: 0.00001
   loss: huber
   huber_delta: 1.0
   train_fraction: 0.70
-  val_fraction: 0.15
+  val_fraction: 0.05
   num_workers: 0
   device: auto
   grad_clip_norm: 1.0
