@@ -1,0 +1,6 @@
+Input Notebook:  /mnt/data3/GraphMamba/notebooks/training.ipynb
+Output Notebook: /mnt/data3/GraphMamba/output/notebooks/training_20260712T003907Z.ipynb
+/home/kyo/.local/lib/python3.10/site-packages/nbformat/__init__.py:96: MissingIDFieldWarning: Cell is missing an id field, this will become a hard error in future nbformat versions. You may want to use `normalize()` on your notebooks before validations (available since nbformat 5.1.4). Previous versions of nbformat are fixing this issue transparently, and will stop doing so in the future.
+  validate(nb)
+Executing:   0%|          | 0/6 [00:00<?, ?cell/s]Executing notebook with kernel: python3
+Executing:  17%|█▋        | 1/6 [00:00<00:04,  1.12cell/s]Executing:  50%|█████     | 3/6 [00:05<00:05,  1.80s/cell]Executing:  67%|██████▋   | 4/6 [00:30<00:19,  9.97s/cell]

@@ -98,9 +98,14 @@ class SpatialGraphMambaBlock(nn.Module):
         Args:
             x: ``[batch, nodes, hidden_dim]``.
         """
+        # CUDA sparse addmm does not support FP16.  Autocast may cast the dense
+        # operand to FP16 (for example when BF16 is unavailable), so keep only
+        # the sparse aggregation in FP32 and resume autocast for the projection.
         graph_messages = []
-        for item in x:
-            graph_messages.append(torch.sparse.mm(adj, item))
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            adj_float = adj.float()
+            for item in x:
+                graph_messages.append(torch.sparse.mm(adj_float, item.float()))
         graph_h = self.graph_proj(torch.stack(graph_messages, dim=0))
 
         ordered = x.index_select(dim=1, index=order)

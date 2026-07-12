@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import random
 import time
@@ -109,6 +110,25 @@ def graph_tensors(graph: dict[str, Any], device: torch.device) -> tuple[torch.Te
     order = torch.as_tensor(graph["hilbert_order"], dtype=torch.long, device=device)
     inverse_order = torch.as_tensor(graph["inverse_hilbert_order"], dtype=torch.long, device=device)
     return adj, order, inverse_order
+
+
+def _amp_settings(train_cfg: dict[str, Any], device: torch.device) -> tuple[bool, torch.dtype]:
+    enabled = bool(train_cfg.get("mixed_precision", True)) and device.type == "cuda"
+    dtype_name = str(train_cfg.get("amp_dtype", "bfloat16")).lower()
+    if dtype_name in {"bf16", "bfloat16"}:
+        if enabled and not torch.cuda.is_bf16_supported():
+            print("CUDA device does not support bfloat16; falling back to float16.", flush=True)
+            return enabled, torch.float16
+        return enabled, torch.bfloat16
+    if dtype_name in {"fp16", "float16"}:
+        return enabled, torch.float16
+    raise ValueError("training.amp_dtype must be 'bfloat16' or 'float16'.")
+
+
+def _autocast(device: torch.device, enabled: bool, dtype: torch.dtype) -> Any:
+    if not enabled:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=dtype)
 
 
 def save_loss_plot(history: list[dict[str, float]], output_path: str | Path) -> Path:
@@ -260,8 +280,20 @@ def evaluate(
     nearest_tempo_distance_km: np.ndarray,
     desc: str = "evaluate",
     show_progress: bool = True,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, float]:
     model.eval()
+    if len(loader.dataset) == 0:
+        return {
+            "rmse": float("nan"),
+            "r2": float("nan"),
+            "abs_error_delta_t_corr": float("nan"),
+            "abs_error_nearest_tempo_distance_corr": float("nan"),
+            "samples": 0,
+            "observations": 0,
+        }
+
     pred_raw_all = []
     y_raw_all = []
     mask_all = []
@@ -278,11 +310,14 @@ def evaluate(
         colour="green",
     )
     for batch in iterator:
-        x = batch["x"].to(device)
-        dt = batch["dt"].to(device)
+        non_blocking = device.type == "cuda"
+        x = batch["x"].to(device, non_blocking=non_blocking)
+        dt = batch["dt"].to(device, non_blocking=non_blocking)
         y_raw = batch["y_raw"].numpy()
         mask = batch["y_mask"].numpy().astype(bool)
-        pred_scaled = model(x, dt).cpu().numpy()
+        with _autocast(device, amp_enabled, amp_dtype):
+            pred_scaled = model(x, dt)
+        pred_scaled = pred_scaled.float().cpu().numpy()
         pred_raw = pred_scaled * target_std + target_mean
         pred_raw_all.append(pred_raw)
         y_raw_all.append(y_raw)
@@ -357,6 +392,21 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
     train_dataset = base_dataset.subset(base_dataset.end_indices[train_end])
     val_dataset = base_dataset.subset(base_dataset.end_indices[val_end])
     test_dataset = base_dataset.subset(base_dataset.end_indices[test_end])
+    if len(train_dataset) == 0:
+        raise ValueError(
+            "Training split is empty. Increase training.train_fraction or use a wider data date range."
+        )
+    print(
+        json.dumps(
+            {
+                "dataset_windows": len(base_dataset),
+                "train_windows": len(train_dataset),
+                "val_windows": len(val_dataset),
+                "test_windows": len(test_dataset),
+            },
+            indent=2,
+        )
+    )
     target_stats = train_dataset.fit_target_scaler()
     val_dataset.with_target_scaler(train_dataset.target_mean, train_dataset.target_std)
     test_dataset.with_target_scaler(train_dataset.target_mean, train_dataset.target_std)
@@ -370,6 +420,12 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
         min_free_memory_gb=float(train_cfg.get("gpu_min_free_memory_gb", 0.0)),
         max_gpus=max_gpus,
     )
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    amp_enabled, amp_dtype = _amp_settings(train_cfg, device)
     adj, order, inverse_order = graph_tensors(graph, device)
     base_model = UnifiedGraphMambaPredictor(
         input_dim=int(model_cfg.get("input_dim", base_dataset.feature_dim)),
@@ -387,32 +443,60 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
     else:
         print(json.dumps({"multi_gpu": False, "device": str(device)}, indent=2))
 
+    gpu_count = len(device_ids) if device_ids else (1 if device.type == "cuda" else 0)
+    per_gpu_batch_size = train_cfg.get("batch_size_per_gpu")
+    if per_gpu_batch_size not in (None, "null", "") and gpu_count > 0:
+        batch_size = int(per_gpu_batch_size) * gpu_count
+    else:
+        batch_size = int(train_cfg.get("batch_size", 2))
+    num_workers = int(train_cfg.get("num_workers", 0))
+    pin_memory = bool(train_cfg.get("pin_memory", device.type == "cuda")) and device.type == "cuda"
+    loader_kwargs: dict[str, Any] = {
+        "num_workers": num_workers,
+        "collate_fn": collate_samples,
+        "pin_memory": pin_memory,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = int(train_cfg.get("prefetch_factor", 2))
+    print(
+        json.dumps(
+            {
+                "global_batch_size": batch_size,
+                "batch_size_per_gpu": batch_size // max(gpu_count, 1),
+                "gpu_count": gpu_count,
+                "mixed_precision": amp_enabled,
+                "amp_dtype": str(amp_dtype).removeprefix("torch."),
+                "num_workers": num_workers,
+                "pin_memory": pin_memory,
+            },
+            indent=2,
+        )
+    )
     train_loader = DataLoader(
         train_dataset,
-        batch_size=int(train_cfg.get("batch_size", 2)),
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=int(train_cfg.get("num_workers", 0)),
-        collate_fn=collate_samples,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=int(train_cfg.get("batch_size", 2)),
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=int(train_cfg.get("num_workers", 0)),
-        collate_fn=collate_samples,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=int(train_cfg.get("batch_size", 2)),
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=int(train_cfg.get("num_workers", 0)),
-        collate_fn=collate_samples,
+        **loader_kwargs,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(train_cfg.get("lr", 3e-4)),
         weight_decay=float(train_cfg.get("weight_decay", 1e-5)),
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
 
     best_val_rmse = float("inf")
     best_path = _best_checkpoint_path(checkpoint_dir)
@@ -492,24 +576,28 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
                     "total_batches": len(train_loader),
                 },
             )
-            x = batch["x"].to(device)
-            dt = batch["dt"].to(device)
-            y = batch["y"].to(device)
-            mask = batch["y_mask"].to(device)
+            non_blocking = device.type == "cuda"
+            x = batch["x"].to(device, non_blocking=non_blocking)
+            dt = batch["dt"].to(device, non_blocking=non_blocking)
+            y = batch["y"].to(device, non_blocking=non_blocking)
+            mask = batch["y_mask"].to(device, non_blocking=non_blocking)
             optimizer.zero_grad(set_to_none=True)
-            pred = model(x, dt)
-            loss = masked_loss(
-                pred,
-                y,
-                mask,
-                str(train_cfg.get("loss", "huber")),
-                float(train_cfg.get("huber_delta", 1.0)),
-            )
-            loss.backward()
+            with _autocast(device, amp_enabled, amp_dtype):
+                pred = model(x, dt)
+                loss = masked_loss(
+                    pred,
+                    y,
+                    mask,
+                    str(train_cfg.get("loss", "huber")),
+                    float(train_cfg.get("huber_delta", 1.0)),
+                )
+            scaler.scale(loss).backward()
             clip_norm = float(train_cfg.get("grad_clip_norm", 0.0))
             if clip_norm > 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             losses.append(float(loss.detach().cpu()))
             elapsed = time.perf_counter() - batch_start
             log_progress_event(
@@ -536,6 +624,8 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
             nearest_dist,
             desc="Validation Epoch",
             show_progress=show_progress,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
         )
         row = {"epoch": epoch, "train_loss": float(np.mean(losses)), **{f"val_{k}": v for k, v in val_metrics.items()}}
         history.append(row)
@@ -581,6 +671,8 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
         nearest_dist,
         desc="Test Epoch",
         show_progress=show_progress,
+        amp_enabled=amp_enabled,
+        amp_dtype=amp_dtype,
     )
     loss_plot_path = save_loss_plot(history, Path(output_dir) / "loss_curve.png") if history else None
     result = {
@@ -593,6 +685,9 @@ def train(config: dict[str, Any]) -> dict[str, Any]:
         "loss_plot": str(loss_plot_path) if loss_plot_path is not None else "",
         "device": str(device),
         "device_ids": device_ids,
+        "global_batch_size": batch_size,
+        "mixed_precision": amp_enabled,
+        "amp_dtype": str(amp_dtype).removeprefix("torch."),
         "resume_training": resume_training,
         "lead_time": float(data_cfg.get("lead_time", 0.0)),
         "history": history,
