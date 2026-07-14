@@ -1,8 +1,8 @@
 run_name: test
 
 paths:
-  tempo_dir: /mnt/data3/TEMPO/NO2_L3_V03
-  airnow_dir: /mnt/data3/AirNow
+  tempo_dir: e:/TEMPO/NO2_L3_V03
+  airnow_dir: e:/AirNow
   checkpoint_root: checkpoints
   output_root: output
   checkpoint_filename: last_model.pt
@@ -39,11 +39,9 @@ model:
 
 training:
   seed: 7
-  epochs: 50
+  epochs: 100
   batch_size: 32
-  # DataParallel splits the global batch across four GPUs. The explicit SSM
-  # scan over all graph nodes is activation-heavy, so keep each A10G shard at 8.
-  batch_size_per_gpu: 8
+  batch_size_per_gpu: 32
   lr: 0.0003
   weight_decay: 0.00001
   loss: huber
@@ -58,22 +56,22 @@ training:
   device: auto
   grad_clip_norm: 1.0
   show_progress: true
-  resume_training: true
+  resume_training: false
   batch_log_interval: 0
-  multi_gpu: on
-  gpu_min_free_memory_gb: 20.
-  gpu_max_count: 4
+  multi_gpu: off
+  gpu_min_free_memory_gb: 40.
+  gpu_max_count: 1
 
 inference:
   start_date: "2024-07-01"
   end_date: "2024-09-30"
   min_valid_targets: 0
-  batch_size: 1
+  batch_size: 32
   num_workers: 0
   device: auto
   show_progress: true
-  multi_gpu: on
-  gpu_min_free_memory_gb: 20.
-  gpu_max_count: 4
+  multi_gpu: off
+  gpu_min_free_memory_gb: 40.
+  gpu_max_count: 1
   output_csv_filename: predictions.csv
   output_netcdf_filename: predictions.nc

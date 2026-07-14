@@ -82,6 +82,35 @@ def _read_tempo_variable(
     return np.asarray(grid[lat_idx, lon_idx], dtype=np.float32)
 
 
+def _read_tempo_variables_multi(
+    path: Path,
+    requests: tuple[tuple[str | None, str], ...],
+    lat_idx: np.ndarray,
+    lon_idx: np.ndarray,
+) -> tuple[np.ndarray | None, ...]:
+    """Read multiple TEMPO variables grouped by NetCDF group, one open per group."""
+    results: dict[int, np.ndarray | None] = {}
+    by_group: dict[str | None, list[tuple[int, str]]] = {}
+    for i, (group, name) in enumerate(requests):
+        by_group.setdefault(group, []).append((i, name))
+
+    for group, items in by_group.items():
+        open_kwargs: dict[str, Any] = {"decode_times": False, "mask_and_scale": True}
+        if group:
+            open_kwargs["group"] = group
+        with xr.open_dataset(path, **open_kwargs) as ds:
+            for i, name in items:
+                if name not in ds.variables:
+                    results[i] = None
+                    continue
+                data = ds[name]
+                if "time" in data.dims:
+                    data = data.isel(time=0)
+                results[i] = np.asarray(np.asarray(data.values)[lat_idx, lon_idx], dtype=np.float32)
+
+    return tuple(results[i] for i in range(len(requests)))
+
+
 def discover_aligned_scans(
     tempo_dir: str | Path,
     airnow_dir: str | Path,
@@ -185,6 +214,23 @@ class TempoAirNowDataset(Dataset):
         self.num_airnow = int(self.graph["metadata"]["num_airnow"])
         self.num_tempo = int(self.graph["metadata"]["num_tempo"])
         self.num_nodes = int(self.graph["metadata"]["num_nodes"])
+        # Cache static per-node arrays once instead of re-extracting every __getitem__ call.
+        self._node_lat = self.graph["node_lat"].astype(np.float32)
+        self._node_lon = self.graph["node_lon"].astype(np.float32)
+        self._node_type = self.graph["node_type"].astype(np.float32)
+        self._tempo_lat_idx = self.graph["tempo_lat_idx"].astype(np.int64)
+        self._tempo_lon_idx = self.graph["tempo_lon_idx"].astype(np.int64)
+        # Build the variable request tuple used by the multi-open reader.
+        _requests: list[tuple[str | None, str]] = [(self.tempo_value_group, self.tempo_value_name)]
+        if self.tempo_quality_name:
+            _requests.append((self.tempo_quality_group, self.tempo_quality_name))
+        if self.tempo_cloud_name:
+            _requests.append((self.tempo_cloud_group, self.tempo_cloud_name))
+        self._tempo_requests = tuple(_requests)
+        self._tempo_cache_maxsize = max(context_steps * 4, 32)
+        # Per-process dict cache; populated lazily in _load_tempo_values.
+        # Dropped during pickling so each DataLoader worker starts with an empty cache.
+        self._tempo_file_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         end_indices = np.arange(context_steps - 1, len(self.aligned_scans), dtype=np.int64)
         self.end_indices = end_indices if scan_indices is None else np.asarray(scan_indices, dtype=np.int64)
         if min_valid_targets > 0:
@@ -198,6 +244,16 @@ class TempoAirNowDataset(Dataset):
             )
         if self.end_indices.size == 0:
             raise ValueError("No windows remain after filtering by min_valid_targets.")
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_tempo_file_cache"] = {}
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        if "_tempo_file_cache" not in self.__dict__:
+            self._tempo_file_cache = {}
 
     @property
     def feature_dim(self) -> int:
@@ -251,14 +307,9 @@ class TempoAirNowDataset(Dataset):
 
     def _load_node_features(self, scan: AlignedScan) -> np.ndarray:
         features = np.zeros((self.num_nodes, self.feature_dim), dtype=np.float32)
-        node_lat = self.graph["node_lat"].astype(np.float32)
-        node_lon = self.graph["node_lon"].astype(np.float32)
-        node_type = self.graph["node_type"].astype(np.float32)
-        features[:, 0] = 0.0
-        features[:, 1] = 0.0
-        features[:, 2] = node_type
-        features[:, 3] = (node_lat - 40.0) / 15.0
-        features[:, 4] = (node_lon + 100.0) / 30.0
+        features[:, 2] = self._node_type
+        features[:, 3] = (self._node_lat - 40.0) / 15.0
+        features[:, 4] = (self._node_lon + 100.0) / 30.0
         features[:, 5] = min(max(scan.delta_t_hours, 0.0), 48.0) / 24.0
 
         tempo_values, valid = self._load_tempo_values(scan.tempo_path)
@@ -269,24 +320,26 @@ class TempoAirNowDataset(Dataset):
         return features
 
     def _load_tempo_values(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
-        lat_idx = self.graph["tempo_lat_idx"].astype(np.int64)
-        lon_idx = self.graph["tempo_lon_idx"].astype(np.int64)
-        values = _read_tempo_variable(path, self.tempo_value_group, self.tempo_value_name, lat_idx, lon_idx)
-        valid = np.isfinite(values)
-        if self.tempo_quality_name:
-            quality = _read_tempo_variable(
-                path, self.tempo_quality_group, self.tempo_quality_name, lat_idx, lon_idx
-            )
-            if quality is not None:
-                valid = valid & (quality == self.tempo_quality_flag_valid)
-        if self.tempo_cloud_name:
-            cloud = _read_tempo_variable(
-                path, self.tempo_cloud_group, self.tempo_cloud_name, lat_idx, lon_idx
-            )
-            if cloud is not None:
-                valid = valid & np.isfinite(cloud) & (cloud <= self.tempo_cloud_fraction_max)
-        values = np.where(valid, values, 0.0).astype(np.float32)
-        return values, valid
+        key = str(path)
+        if key not in self._tempo_file_cache:
+            arrays = _read_tempo_variables_multi(path, self._tempo_requests, self._tempo_lat_idx, self._tempo_lon_idx)
+            values = arrays[0]
+            valid = np.isfinite(values)
+            idx = 1
+            if len(self._tempo_requests) > idx and self._tempo_requests[idx][1]:
+                quality = arrays[idx]
+                idx += 1
+                if quality is not None:
+                    valid = valid & (quality == self.tempo_quality_flag_valid)
+            if len(self._tempo_requests) > idx and self._tempo_requests[idx][1]:
+                cloud = arrays[idx]
+                if cloud is not None:
+                    valid = valid & np.isfinite(cloud) & (cloud <= self.tempo_cloud_fraction_max)
+            values = np.where(valid, values, 0.0).astype(np.float32)
+            if len(self._tempo_file_cache) >= self._tempo_cache_maxsize:
+                self._tempo_file_cache.pop(next(iter(self._tempo_file_cache)))
+            self._tempo_file_cache[key] = (values, valid)
+        return self._tempo_file_cache[key]
 
     def _load_airnow_target(self, timestamp: pd.Timestamp) -> tuple[np.ndarray, np.ndarray]:
         path = _airnow_file_for_time(self.airnow_dir, timestamp)
